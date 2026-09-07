@@ -1,0 +1,54 @@
+[package]
+name = "vidio"
+version = "0.1.0"
+edition = "2024"
+description = "Moniteur vidéo/audio basse latence pour cartes d'acquisition USB"
+license = "MIT"
+
+[[bin]]
+name = "vidio"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+dirs = "6"
+log = "0.4"
+env_logger = "0.11"
+
+# --- vidéo : capture ---
+zune-jpeg = "0.5.16-rc1"
+
+# --- audio ---
+cpal = "0.18"
+rtrb = "0.4"
+
+# --- rendu ---
+wgpu = "30"
+winit = "0.30"
+egui = "0.36"
+egui-wgpu = { version = "0.36", features = ["winit"] }
+egui-winit = { version = "0.36", default-features = false, features = ["links", "wayland", "x11"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = "0.14"
+
+[features]
+default = []
+# Backend PipeWire natif pour cpal (au lieu de passer par ALSA) : réduit un peu
+# la latence mais exige libpipewire + clang au build.
+pipewire = ["cpal/pipewire"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Le décodage JPEG et la conversion de couleurs restent lents en debug ;
+# on optimise les dépendances même dans ce profil.
+[profile.dev.package."*"]
+opt-level = 2
