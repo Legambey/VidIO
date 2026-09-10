@@ -3,7 +3,7 @@ name = "vidio"
 version = "0.1.0"
 edition = "2024"
 description = "Moniteur vidéo/audio basse latence pour cartes d'acquisition USB"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [[bin]]
 name = "vidio"
