@@ -16,6 +16,10 @@
 
 use std::collections::HashMap;
 
+/// Sur les plateformes sans ALSA, l'inventaire reste vide : `card_index` et
+/// `label` renvoient alors `None`, et l'appelant retombe sur le descriptif que
+/// cpal donne lui-même — lequel, sous WASAPI, est déjà le nom lisible du
+/// point de terminaison.
 #[derive(Default)]
 pub struct Catalog {
     /// Identifiant de carte (`sofhdadsp`) → index (`0`).
@@ -71,6 +75,7 @@ pub fn load() -> Catalog {
 
 /// ` 0 [sofhdadsp      ]: sof-hda-dsp - sof-hda-dsp`
 /// suivi d'une ligne indentée de nom long, qu'on ignore.
+#[cfg(any(target_os = "linux", test))]
 fn parse_cards(text: &str, catalog: &mut Catalog) {
     for line in text.lines() {
         let line = line.trim_start();
@@ -90,6 +95,7 @@ fn parse_cards(text: &str, catalog: &mut Catalog) {
 }
 
 /// `00-06: DMIC (*) :  : capture 1`
+#[cfg(any(target_os = "linux", test))]
 fn parse_pcm(text: &str, catalog: &mut Catalog) {
     for line in text.lines() {
         let Some((addr, rest)) = line.trim().split_once(':') else { continue };

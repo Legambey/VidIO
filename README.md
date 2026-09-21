@@ -6,11 +6,18 @@ subir le retard d'un logiciel de capture généraliste.
 
 ## État
 
-Fonctionnel de bout en bout : capture V4L2, décodage, rendu GPU, filtres CRT,
-overlay de réglages et transit audio. Les sous-commandes de diagnostic restent
-disponibles à côté de la fenêtre.
+Fonctionnel de bout en bout sur **Linux** et **Windows** : capture, décodage,
+rendu GPU, filtres CRT, overlay de réglages et transit audio. Les sous-commandes
+de diagnostic restent disponibles à côté de la fenêtre.
+
+La capture passe par V4L2 sous Linux et par Media Foundation sous Windows ; tout
+le reste — négociation de format, rendu, shaders, profils, audio, interface — est
+partagé. Les deux backends sont derrière le même trait et exposent les mêmes
+contrôles matériels.
 
 ## Dépendances
+
+### Linux
 
 Arch Linux :
 
@@ -24,6 +31,31 @@ par `libv4l2`. Le paquet reste utile pour diagnostiquer (`v4l2-ctl`), rien de
 plus. `alsa-lib` est déjà présent sur toute machine avec PipeWire.
 
 L'utilisateur doit appartenir au groupe `video` pour ouvrir `/dev/videoN`.
+
+### Windows
+
+Rien à installer : Media Foundation, WASAPI et Direct3D 12 font partie du
+système. Il faut la chaîne d'outils MSVC (`rustup default stable-msvc` et les
+outils de compilation C++ de Visual Studio, pour l'éditeur de liens), puis :
+
+```
+cargo build --release
+```
+
+Deux points valent d'être connus avant de conclure que « ça ne marche pas » :
+
+- **Confidentialité.** Paramètres › Confidentialité et sécurité › Caméra doit
+  autoriser l'accès, et surtout « Autoriser les applications de bureau à accéder
+  à votre caméra » doit être activé. Sans ça, la carte est parfaitement détectée
+  — elle apparaît dans `vidio list` — mais refuse de s'ouvrir. VidIO le dit
+  explicitement au lieu de relayer le code d'erreur brut.
+- **Console.** Le binaire est une application console : lancé depuis
+  l'Explorateur il ouvre une fenêtre de terminal à côté de la sienne. C'est
+  volontaire — les sous-commandes de diagnostic en ont besoin, et c'est là que
+  s'affiche le journal.
+
+Aucune dépendance Windows n'est compilée sous Linux, et réciproquement : les
+deux crates spécifiques (`v4l`, `windows`) sont déclarées par cible.
 
 ## Utilisation
 
@@ -39,8 +71,10 @@ cargo run -- audio --secs 10 --gain 0.5   # transit entrée → sortie
 cargo run -- config                  # chemin et contenu de la configuration
 ```
 
-Un périphérique se désigne par son index, son nœud (`/dev/video0`), sa clé
-stable ou un fragment de son nom.
+Un périphérique se désigne par son index, son nœud (`/dev/video0` sous Linux, le
+lien symbolique sous Windows), sa clé stable ou un fragment de son nom. C'est le
+fragment de nom qui se retient le mieux : `vidio run Video` suffit si la carte
+s'annonce « USB3.0 Video ».
 
 ## Mesures relevées
 
@@ -110,7 +144,8 @@ src/
 ├── device.rs               identité stable des périphériques
 ├── camera/
 │   ├── mod.rs              trait Camera, formats, plomberie de trames
-│   └── v4l2.rs             backend Linux (ioctls V4L2 directs)
+│   ├── v4l2.rs             backend Linux (ioctls V4L2 directs)
+│   └── mediafoundation.rs  backend Windows (lecteur de source MF)
 ├── audio/
 │   ├── mod.rs              asservissement de dérive, interpolateur, mixage
 │   ├── alsa_catalog.rs     inventaire des PCM réels, lu dans /proc/asound
@@ -129,7 +164,12 @@ src/
 au boot et une carte expose plusieurs nœuds. La clé vient de
 `/dev/v4l/by-id`, dont le nom contient le numéro de série — les réglages
 survivent donc à un changement de port USB, et deux exemplaires du même modèle
-gardent des profils distincts.
+gardent des profils distincts. Sous Windows, le lien symbolique du périphérique
+joue exactement le même rôle et se réduit de la même façon : on en retire le
+préfixe d'espace de noms et le GUID de classe d'interface, qui sont identiques
+pour toutes les caméras, et on garde ce qui distingue — `usb#vid_534d&pid_2109…`.
+Les clés diffèrent d'un système à l'autre, donc les profils aussi ; c'est voulu,
+les contrôles d'un même capteur n'ayant pas les mêmes plages selon le pilote.
 
 **La dernière trame gagne.** Le thread de capture n'attend jamais le
 consommateur : si le rendu décroche, la trame en attente est écrasée. Accumuler
@@ -145,14 +185,33 @@ ce que le matériel ne sait pas faire.
 **Non compressé de préférence.** À résolution et cadence égales, la négociation
 choisit le YUYV plutôt que le MJPEG : il part sur le GPU sans décodage. Le MJPEG
 n'est retenu que lorsque la bande passante USB ne laisse pas le choix — la
-commande `bench` mesure ce que son décodage coûte réellement.
+commande `bench` mesure ce que son décodage coûte réellement. Un format que le
+shader ne sait pas dépaqueter — le RGB à trois octets par pixel, qui n'a aucune
+texture GPU correspondante — passe derrière le MJPEG dans cet ordre de
+préférence : il reste listé, une carte pouvant n'avoir que ça, mais n'est jamais
+choisi d'office. Proposer un format qu'on ne peut pas afficher, c'est promettre
+un écran noir.
 
-**Le YUYV ne touche jamais le CPU.** Une trame YUYV part sur le GPU telle
+**Aucun convertisseur, des deux côtés.** C'est le même parti pris, obtenu
+autrement selon le système. Sous Linux, la crate `v4l` est utilisée sans
+`libv4lconvert`. Sous Windows, le lecteur de source reçoit
+`MF_READWRITE_DISABLE_CONVERTERS` : sans cette ligne, Media Foundation « rend
+service » en insérant un décodeur et un convertisseur de couleurs, et livre du
+RGB32 converti sur le CPU — une copie et quelques millisecondes par trame, sur
+un chemin où l'on compte les deux. Le corollaire est qu'il faut savoir lire ce
+que la carte émet vraiment : YUYV, UYVY, NV12, GREY et MJPEG sont tous
+dépaquetés dans le shader, le NV12 en particulier parce que c'est ce que le
+serveur de trames de Windows expose nativement pour beaucoup de périphériques.
+
+**Le YUV ne touche jamais le CPU.** Une trame YUYV part sur le GPU telle
 quelle, envoyée dans une texture RGBA de demi-largeur : un texel porte
-`(Y0, U, Y1, V)`, soit deux pixels voisins partageant leur chrominance. Le
-dépaquetage et la conversion en RGB ont lieu dans le shader. La matrice
-(BT.601 ou BT.709) et la plage (complète ou réduite) sont lues dans ce que
-rapporte le pilote — s'y tromper verdit les images ou délave les noirs.
+`(Y0, U, Y1, V)`, soit deux pixels voisins partageant leur chrominance. L'UYVY
+est le même arrangement dans l'autre ordre. Le NV12, lui, est planaire : sa
+texture est une bande d'octets où le plan de chrominance, entrelacé et de
+demi-résolution, est posé sous le plan de luminance — une seule texture, un seul
+transfert. Le dépaquetage et la conversion en RGB ont lieu dans le shader. La
+matrice (BT.601 ou BT.709) et la plage (complète ou réduite) sont lues dans ce
+que rapporte le pilote — s'y tromper verdit les images ou délave les noirs.
 
 **Les limites du GPU, pas celles de wgpu.** Le périphérique est ouvert avec
 les limites que l'adaptateur annonce. Celles par défaut de wgpu plafonnent les
@@ -173,11 +232,20 @@ configurée pour une seule trame en vol.
 trame pour le faire, et non sur le thread de rendu où ces millisecondes se
 paieraient en retard à l'affichage.
 
+**Débloquer une attente qui n'a pas de fin.** Le thread de capture est arrêté
+par un drapeau qu'il teste entre deux trames — encore faut-il qu'il en reçoive
+une. V4L2 se plafonne à l'ioctl près, mais `ReadSample` de Media Foundation
+attend sans limite de temps : une console éteinte, un câble débranché, et
+fermer la fenêtre attendrait pour toujours une trame qui ne viendra pas. Le
+backend dépose donc sur la capture de quoi faire échouer l'attente en cours —
+côté Windows, éteindre la source.
+
 **Une entrée audio par matériel, pas par nom ALSA.** ALSA n'expose pas des
 périphériques mais des noms de PCM, et cpal y ajoute les siens : la même entrée
 ressort jusqu'à cinq fois (`hw:`, `plughw:`, `default:CARD=`, `sysdefault:`,
 `front:`), avec un descriptif identique parce que cpal n'en garde que la
-première ligne. La liste regroupe ces routes par PCM réel — la correspondance
+première ligne. (Ce regroupement ne concerne qu'ALSA : WASAPI nomme ses points
+de terminaison une fois chacun, et la liste y est directement lisible.) La liste regroupe ces routes par PCM réel — la correspondance
 entre `CARD=sofhdadsp` et `CARD=0` se lit dans `/proc/asound`, qui fournit au
 passage le nom du sous-périphérique — et garde `hw:`, la route la plus courte :
 sans conversion ni mixage, puisque le transit fait déjà les deux lui-même. Le

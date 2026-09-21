@@ -82,23 +82,6 @@ fn by_id_map() -> HashMap<PathBuf, String> {
     map
 }
 
-/// Retrouve un périphérique par sa clé, son chemin ou son index.
-pub fn find(spec: &str) -> Result<VideoDevice> {
-    let devices = enumerate()?;
-    devices
-        .iter()
-        .find(|d| d.key.as_str() == spec)
-        .or_else(|| devices.iter().find(|d| d.path.to_string_lossy() == spec))
-        .or_else(|| {
-            spec.parse::<usize>()
-                .ok()
-                .and_then(|i| devices.iter().find(|d| d.index == i))
-        })
-        .or_else(|| devices.iter().find(|d| d.card.contains(spec)))
-        .cloned()
-        .ok_or_else(|| anyhow!("aucun périphérique ne correspond à « {spec} »"))
-}
-
 /// Traduit la colorimétrie annoncée par le pilote.
 ///
 /// `Default` est fréquent — beaucoup de pilotes UVC ne renseignent rien — et on

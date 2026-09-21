@@ -2,8 +2,11 @@
 //! consommateur (rendu ou CLI).
 //!
 //! Le backend concret est derrière le trait [`Camera`]. Sur Linux c'est
-//! [`v4l2`], en accès direct aux ioctls V4L2 — pas de couche de conversion
-//! intermédiaire, et l'intégralité des contrôles matériels de l'appareil.
+//! [`v4l2`], en accès direct aux ioctls V4L2 ; sur Windows [`mediafoundation`],
+//! en accès direct au lecteur de source. Dans les deux cas sans couche de
+//! conversion intermédiaire — pas de `libv4lconvert`, pas de convertisseur
+//! inséré par Media Foundation — et avec l'intégralité des contrôles matériels
+//! de l'appareil.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -13,6 +16,9 @@ use anyhow::Result;
 
 #[cfg(target_os = "linux")]
 pub mod v4l2;
+
+#[cfg(windows)]
+pub mod mediafoundation;
 
 /// Format de pixel tel qu'il sort de l'appareil, sans conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,16 +87,35 @@ impl PixelFormat {
         if self.is_compressed() { Self::Rgba8 } else { self }
     }
 
+    /// Le rendu sait-il afficher ce format sans passer par le CPU ?
+    ///
+    /// Sert à la négociation : proposer d'office un format que le shader ne
+    /// sait pas dépaqueter, c'est promettre un écran noir. Le MJPEG compte
+    /// comme affichable — il est décodé en RGBA avant publication.
+    pub fn is_displayable(&self) -> bool {
+        matches!(
+            self,
+            Self::Yuyv | Self::Uyvy | Self::Nv12 | Self::Grey | Self::Rgba8 | Self::Mjpeg
+        )
+    }
+
     /// Préférence de négociation, du meilleur au moins bon. Les formats non
     /// compressés gagnent : zéro décodage, donc zéro latence ajoutée et un CPU
     /// qui reste froid. Le MJPEG ne sert que quand l'USB ne peut pas suivre.
+    ///
+    /// Les formats que le rendu ne sait pas dépaqueter passent derrière lui :
+    /// le RGB à trois octets par pixel n'a pas de texture GPU correspondante et
+    /// demanderait une réécriture CPU de chaque trame. Ils restent listés — une
+    /// carte peut n'avoir que ça, et mieux vaut alors un message clair qu'une
+    /// absence — mais ne sont jamais choisis d'office.
     fn rank(&self) -> u8 {
         match self {
             Self::Yuyv | Self::Uyvy => 0,
             Self::Nv12 | Self::Grey => 1,
-            Self::Rgb24 | Self::Bgr24 | Self::Rgba8 => 2,
+            Self::Rgba8 => 2,
             Self::Mjpeg => 3,
-            Self::Unknown(_) => 4,
+            Self::Rgb24 | Self::Bgr24 => 4,
+            Self::Unknown(_) => 5,
         }
     }
 }
@@ -181,8 +206,21 @@ impl FormatRequest {
     /// Ordre des critères : la résolution exacte d'abord (on ne veut pas d'un
     /// rééchantillonnage surprise), puis la cadence, puis le format de pixel.
     pub fn pick<'a>(&self, caps: &'a [FormatCaps]) -> Option<&'a FormatCaps> {
-        caps.iter()
-            .filter(|c| self.pixfmt.is_none_or(|p| p == c.pixfmt))
+        // Un format demandé nommément est honoré tel quel ; sans demande, on
+        // n'envisage que ce que le rendu sait afficher — sauf si l'appareil
+        // n'offre rien d'autre, auquel cas on laisse l'étage suivant expliquer
+        // pourquoi ça ne marche pas.
+        let displayable = |c: &&FormatCaps| c.pixfmt.is_displayable();
+        let usable: Vec<&FormatCaps> = match self.pixfmt {
+            Some(want) => caps.iter().filter(|c| c.pixfmt == want).collect(),
+            None => {
+                let shown: Vec<&FormatCaps> = caps.iter().filter(displayable).collect();
+                if shown.is_empty() { caps.iter().collect() } else { shown }
+            }
+        };
+
+        usable
+            .into_iter()
             .min_by_key(|c| {
                 let size_err = (c.width as i64 - self.width as i64).abs()
                     + (c.height as i64 - self.height as i64).abs();
@@ -194,6 +232,12 @@ impl FormatRequest {
 }
 
 /// Type d'un contrôle matériel, pour savoir quel widget afficher.
+///
+/// C'est le vocabulaire commun des deux backends, pas le plus petit
+/// dénominateur : V4L2 expose des menus et des boutons d'action que les deux
+/// interfaces DirectShow de Media Foundation n'ont pas. L'overlay sait dessiner
+/// les quatre, et un backend n'en produit que ce que sa plateforme connaît.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ControlKind {
     Integer { min: i64, max: i64, step: i64 },
@@ -328,6 +372,14 @@ pub struct Capture {
     format: FrameFormat,
     controls: Arc<dyn CameraControls>,
     pub(crate) thread: Option<std::thread::JoinHandle<()>>,
+    /// Tire le thread de capture hors de son attente de trame.
+    ///
+    /// Un drapeau ne suffit pas partout : V4L2 se plafonne à l'ioctl près, mais
+    /// `ReadSample` de Media Foundation bloque sans limite de temps. Une console
+    /// éteinte, une carte qui ne délivre plus rien, et fermer la fenêtre
+    /// attendrait pour toujours une trame qui ne viendra pas. Le backend
+    /// dépose ici de quoi faire échouer l'attente en cours.
+    pub(crate) unblock: Option<Box<dyn Fn() + Send>>,
 }
 
 impl Capture {
@@ -379,6 +431,9 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         self.shared.running.store(false, Ordering::Relaxed);
+        if let Some(unblock) = self.unblock.take() {
+            unblock();
+        }
         if let Some(t) = self.thread.take() {
             // Le thread teste `should_run` entre deux trames ; il sort au pire
             // après le délai d'attente d'une trame.
@@ -401,7 +456,7 @@ pub fn channel(
         running: AtomicBool::new(true),
     });
     let sink = FrameSink { shared: Arc::clone(&shared), notify };
-    let capture = Capture { shared, format, controls, thread: None };
+    let capture = Capture { shared, format, controls, thread: None, unblock: None };
     (sink, capture)
 }
 
@@ -431,7 +486,11 @@ pub fn enumerate() -> Result<Vec<crate::device::VideoDevice>> {
     {
         v4l2::enumerate()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        mediafoundation::enumerate()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         anyhow::bail!("aucun backend de capture pour cette plateforme")
     }
@@ -443,11 +502,36 @@ pub fn open(device: &crate::device::VideoDevice) -> Result<Box<dyn Camera>> {
     {
         Ok(Box::new(v4l2::V4l2Camera::open(device.clone())?))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        Ok(Box::new(mediafoundation::MfCamera::open(device.clone())?))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = device;
         anyhow::bail!("aucun backend de capture pour cette plateforme")
     }
+}
+
+/// Retrouve un périphérique par sa clé, son nœud, son index ou un fragment de
+/// son nom.
+///
+/// La désignation ne dépend pas du backend : c'est la même liste des deux
+/// côtés, seule la façon de la produire change.
+pub fn find(spec: &str) -> Result<crate::device::VideoDevice> {
+    let devices = enumerate()?;
+    devices
+        .iter()
+        .find(|d| d.key.as_str() == spec)
+        .or_else(|| devices.iter().find(|d| d.path.to_string_lossy() == spec))
+        .or_else(|| {
+            spec.parse::<usize>()
+                .ok()
+                .and_then(|i| devices.iter().find(|d| d.index == i))
+        })
+        .or_else(|| devices.iter().find(|d| d.card.contains(spec)))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("aucun périphérique ne correspond à « {spec} »"))
 }
 
 #[cfg(test)]
@@ -470,6 +554,29 @@ mod tests {
         assert_eq!((picked.width, picked.height), (1280, 720));
         // À résolution et cadence égales, le non compressé l'emporte.
         assert_eq!(picked.pixfmt, PixelFormat::Yuyv);
+    }
+
+    #[test]
+    fn undisplayable_formats_are_not_picked_by_default() {
+        // Une carte qui annonce du RGB24 et du YUYV à la même taille : le RGB
+        // à trois octets par pixel n'a pas de texture GPU correspondante, il ne
+        // doit jamais sortir de la négociation automatique.
+        let caps = vec![
+            FormatCaps { pixfmt: PixelFormat::Rgb24, width: 720, height: 576, fps: vec![50] },
+            FormatCaps { pixfmt: PixelFormat::Yuyv, width: 720, height: 576, fps: vec![50] },
+        ];
+        let req = FormatRequest { width: 720, height: 576, fps: 50, ..Default::default() };
+        assert_eq!(req.pick(&caps).unwrap().pixfmt, PixelFormat::Yuyv);
+    }
+
+    #[test]
+    fn a_device_offering_only_the_undisplayable_still_negotiates() {
+        // Mieux vaut aller jusqu'au message d'erreur du rendu, qui nomme le
+        // format en cause, que de prétendre ici que l'appareil n'a rien.
+        let caps =
+            vec![FormatCaps { pixfmt: PixelFormat::Rgb24, width: 720, height: 576, fps: vec![50] }];
+        let req = FormatRequest { width: 720, height: 576, fps: 50, ..Default::default() };
+        assert_eq!(req.pick(&caps).unwrap().pixfmt, PixelFormat::Rgb24);
     }
 
     #[test]

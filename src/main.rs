@@ -135,7 +135,15 @@ fn cmd_list() -> Result<()> {
     let devices = camera::enumerate()?;
     println!("Vidéo ({} périphérique(s))", devices.len());
     if devices.is_empty() {
+        // Le premier obstacle n'est pas le même des deux côtés, et dans les deux
+        // cas rien ne le signale : c'est une liste vide, point.
+        #[cfg(target_os = "linux")]
         println!("  (aucun — vérifier l'appartenance au groupe « video »)");
+        #[cfg(windows)]
+        println!(
+            "  (aucun — vérifier Paramètres › Confidentialité et sécurité › Caméra, \
+             et « Autoriser les applications de bureau à accéder à votre caméra »)"
+        );
     }
     for d in &devices {
         println!("  [{}] {}", d.index, d.label());
@@ -166,18 +174,8 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn find_device(spec: &str) -> Result<device::VideoDevice> {
-    camera::v4l2::find(spec)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn find_device(_spec: &str) -> Result<device::VideoDevice> {
-    anyhow::bail!("aucun backend de capture pour cette plateforme")
-}
-
 fn cmd_formats(spec: &str) -> Result<()> {
-    let dev = find_device(spec)?;
+    let dev = camera::find(spec)?;
     let camera = camera::open(&dev)?;
     let caps = camera.caps()?;
 
@@ -205,7 +203,7 @@ fn cmd_formats(spec: &str) -> Result<()> {
 }
 
 fn cmd_controls(spec: &str) -> Result<()> {
-    let dev = find_device(spec)?;
+    let dev = camera::find(spec)?;
     let camera = camera::open(&dev)?;
     let controls = camera.control_handle().controls()?;
 
@@ -251,7 +249,7 @@ fn cmd_controls(spec: &str) -> Result<()> {
 }
 
 fn cmd_set(spec: &str, control: &str, value: i64) -> Result<()> {
-    let dev = find_device(spec)?;
+    let dev = camera::find(spec)?;
     let camera = camera::open(&dev)?;
     let handle = camera.control_handle();
 
@@ -311,7 +309,7 @@ fn cmd_run(
     // silence sur un autre serait pire que l'erreur. Le dernier utilisé, lui,
     // peut avoir été débranché — on prend alors ce qui est là.
     let dev = match spec {
-        Some(spec) => find_device(spec)?,
+        Some(spec) => camera::find(spec)?,
         None => {
             let devices = camera::enumerate()?;
             config
@@ -339,7 +337,7 @@ fn cmd_bench(
     fps: Option<u32>,
     fourcc: Option<&str>,
 ) -> Result<()> {
-    let dev = find_device(spec)?;
+    let dev = camera::find(spec)?;
     let cfg = Config::load()?;
     let profile = cfg.profile(&dev.key).cloned().unwrap_or_default();
     let req = build_request(&profile, width, height, fps, fourcc);

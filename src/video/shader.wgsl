@@ -32,6 +32,8 @@ const FLAG_CRT: u32          = 8u;
 const FLAG_SMOOTH: u32       = 16u;
 const FLAG_SRGB_SURFACE: u32 = 32u;
 const FLAG_GREY: u32         = 64u;
+const FLAG_UYVY: u32         = 128u;
+const FLAG_NV12: u32         = 256u;
 
 const PI: f32 = 3.14159265;
 
@@ -102,12 +104,18 @@ fn yuv_to_rgb(luma: f32, cb_in: f32, cr_in: f32) -> vec3<f32> {
     return clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-// Lit un pixel source. Le YUYV est stocké en texture RGBA de demi-largeur :
-// un texel porte (Y0, U, Y1, V), soit deux pixels voisins qui partagent leur
-// chrominance. C'est ce qui permet de l'envoyer au GPU sans le convertir.
+// Lit un pixel source, dans la disposition où l'appareil l'a produit — aucun de
+// ces dépaquetages n'a coûté un cycle de CPU.
+//
+// Le YUYV et l'UYVY sont stockés en texture RGBA de demi-largeur : un texel
+// porte deux pixels voisins qui partagent leur chrominance. Le NV12 est
+// planaire ; sa texture est une bande d'octets où le plan de chrominance,
+// entrelacé et de demi-résolution, est posé sous le plan de luminance.
 fn fetch(ix: i32, iy: i32) -> vec3<f32> {
-    let x = clamp(ix, 0, i32(u.src_size.x) - 1);
-    let y = clamp(iy, 0, i32(u.src_size.y) - 1);
+    let w = i32(u.src_size.x);
+    let h = i32(u.src_size.y);
+    let x = clamp(ix, 0, w - 1);
+    let y = clamp(iy, 0, h - 1);
 
     if (has(FLAG_GREY)) {
         // Luminance seule : on la recopie sur les trois canaux.
@@ -115,12 +123,34 @@ fn fetch(ix: i32, iy: i32) -> vec3<f32> {
     }
 
     if (has(FLAG_YUYV)) {
+        // (Y0, U, Y1, V)
         let texel = textureLoad(src, vec2<i32>(x / 2, y), 0);
         var luma = texel.r;
         if ((x & 1) == 1) {
             luma = texel.b;
         }
         return yuv_to_rgb(luma, texel.g, texel.a);
+    }
+
+    if (has(FLAG_UYVY)) {
+        // (U, Y0, V, Y1) — mêmes octets, ordre inverse.
+        let texel = textureLoad(src, vec2<i32>(x / 2, y), 0);
+        var luma = texel.g;
+        if ((x & 1) == 1) {
+            luma = texel.a;
+        }
+        return yuv_to_rgb(luma, texel.r, texel.b);
+    }
+
+    if (has(FLAG_NV12)) {
+        let luma = textureLoad(src, vec2<i32>(x, y), 0).r;
+        // Une paire (Cb, Cr) pour quatre pixels : on retombe sur le début de la
+        // paire, puis on descend dans le plan de chrominance.
+        let cx = (x / 2) * 2;
+        let cy = h + y / 2;
+        let cb = textureLoad(src, vec2<i32>(cx, cy), 0).r;
+        let cr = textureLoad(src, vec2<i32>(min(cx + 1, w - 1), cy), 0).r;
+        return yuv_to_rgb(luma, cb, cr);
     }
 
     return textureLoad(src, vec2<i32>(x, y), 0).rgb;
