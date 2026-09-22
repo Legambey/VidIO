@@ -4,6 +4,11 @@
 //! persistante, capture V4L2 et transit audio. Les sous-commandes permettent de
 //! vérifier le matériel avant que le rendu GPU n'entre en jeu.
 
+// Sans ça, Windows ouvre une console pour chaque lancement, y compris depuis
+// l'explorateur. Les sous-commandes restent utilisables : `console::attach`
+// rejoint celle du terminal appelant quand il y en a un.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod audio;
 mod camera;
@@ -101,7 +106,66 @@ enum Command {
     Config,
 }
 
+/// Rattachement à la console du terminal appelant, sur Windows uniquement.
+///
+/// Le sous-système « windows » supprime la console automatique, mais coupe aussi
+/// la sortie des sous-commandes. On rejoint donc celle du processus parent quand
+/// elle existe ; lancé depuis l'explorateur, il n'y en a pas et on n'écrit nulle
+/// part, ce qui est le comportement voulu.
+#[cfg(windows)]
+mod console {
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    use windows::core::{PCWSTR, w};
+
+    pub fn attach() {
+        unsafe {
+            // Échoue quand le lanceur n'a pas de console (explorateur, raccourci).
+            if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+                return;
+            }
+            rewire(STD_INPUT_HANDLE, w!("CONIN$"), GENERIC_READ.0);
+            rewire(STD_OUTPUT_HANDLE, w!("CONOUT$"), GENERIC_WRITE.0);
+            rewire(STD_ERROR_HANDLE, w!("CONOUT$"), GENERIC_WRITE.0);
+        }
+    }
+
+    unsafe fn rewire(which: STD_HANDLE, path: PCWSTR, access: u32) {
+        // Une redirection explicite (`vidio list > sortie.txt`) laisse un handle
+        // valide, hérité du shell : l'écraser casserait le fichier de sortie.
+        if let Ok(existing) = unsafe { GetStdHandle(which) } {
+            if !existing.is_invalid() && !existing.0.is_null() {
+                return;
+            }
+        }
+
+        let handle = unsafe {
+            CreateFileW(
+                path,
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+        };
+        if let Ok(handle) = handle {
+            let _ = unsafe { SetStdHandle(which, handle) };
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    console::attach();
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let command = Cli::parse().command.unwrap_or(Command::Run {

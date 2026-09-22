@@ -44,6 +44,9 @@ windows = { version = "0.62", features = [
     "Win32_Media_MediaFoundation",
     "Win32_Media_DirectShow",
     "Win32_System_Com",
+    # Rattachement à la console du terminal appelant : voir `console` dans main.rs.
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
 ] }
 
 [features]

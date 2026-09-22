@@ -143,6 +143,14 @@ impl App {
                 self.request.width.max(640),
                 self.request.height.max(480),
             ));
+        // Media Foundation met le thread principal en MTA ; winit y appelle
+        // OleInitialize pour le glisser-déposer, qui exige un STA et panique sur
+        // RPC_E_CHANGED_MODE. VidIO n'accepte aucun fichier déposé.
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_drag_and_drop(false)
+        };
         let window = Arc::new(event_loop.create_window(attrs).context("création de la fenêtre")?);
 
         if self.config.general.fullscreen {
