@@ -188,6 +188,11 @@ pub struct FormatRequest {
     pub height: u32,
     pub fps: u32,
     pub pixfmt: Option<PixelFormat>,
+    /// `true` quand le format vient d'être nommé pour cette ouverture (`--fourcc`,
+    /// ou un choix dans l'overlay) : il est alors honoré ou rien. `false` quand
+    /// ce n'est qu'un souvenir de profil, qui ne doit pas condamner un appareil
+    /// dont les formats ont changé.
+    pub pixfmt_required: bool,
     /// Nombre de tampons côté pilote. Peu de tampons = moins de latence de file
     /// d'attente ; en dessous de 3 le pilote risque de manquer de tampon libre
     /// et de perdre des trames.
@@ -196,7 +201,7 @@ pub struct FormatRequest {
 
 impl Default for FormatRequest {
     fn default() -> Self {
-        Self { width: 1280, height: 720, fps: 60, pixfmt: None, buffers: 3 }
+        Self { width: 1280, height: 720, fps: 60, pixfmt: None, pixfmt_required: false, buffers: 3 }
     }
 }
 
@@ -206,17 +211,27 @@ impl FormatRequest {
     /// Ordre des critères : la résolution exacte d'abord (on ne veut pas d'un
     /// rééchantillonnage surprise), puis la cadence, puis le format de pixel.
     pub fn pick<'a>(&self, caps: &'a [FormatCaps]) -> Option<&'a FormatCaps> {
-        // Un format demandé nommément est honoré tel quel ; sans demande, on
-        // n'envisage que ce que le rendu sait afficher — sauf si l'appareil
-        // n'offre rien d'autre, auquel cas on laisse l'étage suivant expliquer
-        // pourquoi ça ne marche pas.
         let displayable = |c: &&FormatCaps| c.pixfmt.is_displayable();
-        let usable: Vec<&FormatCaps> = match self.pixfmt {
+
+        // Un format nommé est honoré tel quel dès que l'appareil l'annonce.
+        let named: Vec<&FormatCaps> = match self.pixfmt {
             Some(want) => caps.iter().filter(|c| c.pixfmt == want).collect(),
-            None => {
-                let shown: Vec<&FormatCaps> = caps.iter().filter(displayable).collect();
-                if shown.is_empty() { caps.iter().collect() } else { shown }
-            }
+            None => Vec::new(),
+        };
+
+        let usable: Vec<&FormatCaps> = if !named.is_empty() {
+            named
+        } else if self.pixfmt.is_some() && self.pixfmt_required {
+            // Demandé pour cette ouverture-ci : en servir un autre en silence
+            // tromperait sur ce qui s'affiche.
+            return None;
+        } else {
+            // Sans demande — ou avec un souvenir de profil que cet appareil
+            // n'honore pas — on n'envisage que ce que le rendu sait afficher,
+            // sauf s'il n'offre rien d'autre : l'étage suivant expliquera alors
+            // pourquoi ça ne marche pas.
+            let shown: Vec<&FormatCaps> = caps.iter().filter(displayable).collect();
+            if shown.is_empty() { caps.iter().collect() } else { shown }
         };
 
         usable
@@ -228,6 +243,29 @@ impl FormatRequest {
                 let fps_err = (best_fps as i64 - self.fps as i64).abs();
                 (size_err, fps_err, c.pixfmt.rank())
             })
+    }
+}
+
+/// L'échec de négociation, formulé avec ce que l'appareil annonce vraiment.
+///
+/// « aucun format exploitable » seul envoie chercher un bug côté appareil alors
+/// que c'est le plus souvent la demande qui ne correspond plus.
+pub fn no_format_error(req: &FormatRequest, caps: &[FormatCaps]) -> anyhow::Error {
+    if caps.is_empty() {
+        return anyhow::anyhow!("l'appareil n'annonce aucun format");
+    }
+
+    let mut offered: Vec<String> = caps.iter().map(|c| c.pixfmt.name()).collect();
+    offered.sort_unstable();
+    offered.dedup();
+    let offered = offered.join(", ");
+
+    match req.pixfmt {
+        Some(want) => anyhow::anyhow!(
+            "format {} demandé, que cet appareil n'annonce pas (il propose : {offered})",
+            want.name()
+        ),
+        None => anyhow::anyhow!("aucun format exploitable parmi : {offered}"),
     }
 }
 
@@ -590,6 +628,39 @@ mod tests {
         };
         let caps = caps();
         assert_eq!(req.pick(&caps).unwrap().pixfmt, PixelFormat::Mjpeg);
+    }
+
+    #[test]
+    fn a_remembered_format_never_condemns_the_device() {
+        // Le profil d'un appareil peut avoir été écrit pour un autre : sur cette
+        // machine, deux caméras d'un même boîtier USB se partagent une clé
+        // `by-id`. Un souvenir de MJPG ne doit pas faire échouer l'ouverture
+        // d'un capteur qui ne sort que du GREY.
+        let caps =
+            vec![FormatCaps { pixfmt: PixelFormat::Grey, width: 640, height: 360, fps: vec![30] }];
+        let req = FormatRequest {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            pixfmt: Some(PixelFormat::Mjpeg),
+            ..Default::default()
+        };
+        assert_eq!(req.pick(&caps).unwrap().pixfmt, PixelFormat::Grey);
+    }
+
+    #[test]
+    fn a_format_named_for_this_run_is_not_substituted() {
+        let caps =
+            vec![FormatCaps { pixfmt: PixelFormat::Grey, width: 640, height: 360, fps: vec![30] }];
+        let req = FormatRequest {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            pixfmt: Some(PixelFormat::Mjpeg),
+            pixfmt_required: true,
+            ..Default::default()
+        };
+        assert!(req.pick(&caps).is_none());
     }
 
     #[test]

@@ -402,9 +402,19 @@ impl Camera for MfCamera {
 
     fn negotiate(&mut self, req: &FormatRequest) -> Result<FrameFormat> {
         let caps = self.caps()?;
-        let chosen = req
-            .pick(&caps)
-            .ok_or_else(|| anyhow!("l'appareil n'annonce aucun format exploitable"))?;
+        let chosen = req.pick(&caps).ok_or_else(|| super::no_format_error(req, &caps))?;
+
+        // Un format retenu qui n'est pas celui demandé vient forcément d'un
+        // profil : le dire, sinon l'image change sans explication.
+        if let Some(want) = req.pixfmt
+            && want != chosen.pixfmt
+        {
+            log::warn!(
+                "{} indisponible sur cet appareil : {} retenu à la place",
+                want.name(),
+                chosen.pixfmt.name()
+            );
+        }
         let target_fps = chosen
             .fps
             .iter()

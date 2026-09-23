@@ -608,6 +608,7 @@ impl App {
                 height: profile.video.height,
                 fps: profile.video.fps,
                 pixfmt: profile.video.fourcc.as_deref().map(fourcc_of),
+                pixfmt_required: false,
                 buffers: self.request.buffers,
             };
             self.reopen(device, request);
@@ -620,6 +621,8 @@ impl App {
                 height: option.height,
                 fps: option.fps,
                 pixfmt: Some(option.pixfmt),
+                // Choisi à la main dans l'overlay, parmi ce que l'appareil annonce.
+                pixfmt_required: true,
                 buffers: self.request.buffers,
             };
             // Le format choisi devient celui du profil : c'est lui qu'on

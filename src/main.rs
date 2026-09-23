@@ -355,6 +355,8 @@ fn build_request(
         height: height.unwrap_or(profile.video.height),
         fps: fps.unwrap_or(profile.video.fps),
         pixfmt,
+        // Seul `--fourcc` engage : le fourcc du profil n'est qu'une préférence.
+        pixfmt_required: fourcc.is_some(),
         buffers: 3,
     }
 }
