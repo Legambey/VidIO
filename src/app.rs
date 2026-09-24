@@ -12,7 +12,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::audio::{self, AudioControls, AudioDeviceInfo, Passthrough};
-use crate::camera::{self, Capture, ControlDesc, FormatRequest, PixelFormat};
+use crate::camera::{self, Capture, ControlDesc, FormatCaps, FormatRequest, PixelFormat};
 use crate::config::{AudioSettings, ColorSettings, Config, CrtSettings, Profile};
 use crate::device::VideoDevice;
 use crate::ui::{self, AudioTelemetry, Choice, CrtPreset, Osd, PanelState, Selection, Telemetry};
@@ -63,6 +63,14 @@ pub struct App {
 
     /// Périphériques proposés dans le panneau, relus à son ouverture.
     devices: Vec<VideoDevice>,
+    /// Capacités du périphérique courant, relevées à l'ouverture.
+    ///
+    /// Elles sont retenues plutôt que redemandées : sous Windows, une source
+    /// Media Foundation déjà en train de diffuser ne se laisse pas rouvrir pour
+    /// être interrogée, et le panneau se retrouverait sans liste de formats.
+    /// Sur Linux ça évite simplement d'ouvrir un second descripteur à chaque
+    /// ouverture du panneau.
+    caps: Vec<FormatCaps>,
     formats: Vec<FormatOption>,
     audio_inputs: Vec<AudioDeviceInfo>,
     audio_outputs: Vec<AudioDeviceInfo>,
@@ -110,6 +118,7 @@ impl App {
             audio_wanted: audio,
             proxy,
             devices: Vec::new(),
+            caps: Vec::new(),
             formats: Vec::new(),
             audio_inputs: Vec::new(),
             audio_outputs: Vec::new(),
@@ -134,6 +143,14 @@ impl App {
                 self.request.width.max(640),
                 self.request.height.max(480),
             ));
+        // Media Foundation met le thread principal en MTA ; winit y appelle
+        // OleInitialize pour le glisser-déposer, qui exige un STA et panique sur
+        // RPC_E_CHANGED_MODE. VidIO n'accepte aucun fichier déposé.
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_drag_and_drop(false)
+        };
         let window = Arc::new(event_loop.create_window(attrs).context("création de la fenêtre")?);
 
         if self.config.general.fullscreen {
@@ -165,6 +182,7 @@ impl App {
         });
 
         let camera = camera::open(&self.device)?;
+        self.caps = camera.caps().unwrap_or_default();
         let capture = camera.start(self.request.clone(), Some(notify))?;
 
         // Le profil enregistré s'applique au capteur au démarrage : c'est nous
@@ -208,14 +226,7 @@ impl App {
     /// Aplatit les capacités du périphérique en une liste de choix triée du
     /// plus ambitieux au plus modeste.
     fn enumerate_formats(&self) -> Vec<FormatOption> {
-        let Ok(camera) = camera::open(&self.device) else {
-            return Vec::new();
-        };
-        let Ok(caps) = camera.caps() else {
-            return Vec::new();
-        };
-
-        let mut options = format_options(&caps);
+        let mut options = format_options(&self.caps);
         // Proposer un format que le GPU ne peut pas recevoir, c'est promettre
         // un écran noir : la carte annonce jusqu'au 4K, les textures d'un GPU
         // ont une taille maximale, et rien ne les met en rapport ailleurs.
@@ -268,11 +279,14 @@ impl App {
             let _ = proxy.send_event(Wake::Frame);
         });
 
-        let opened = camera::open(&self.device)
-            .and_then(|camera| camera.start(self.request.clone(), Some(notify)));
+        let opened = camera::open(&self.device).and_then(|camera| {
+            let caps = camera.caps().unwrap_or_default();
+            camera.start(self.request.clone(), Some(notify)).map(|capture| (capture, caps))
+        });
 
         match opened {
-            Ok(capture) => {
+            Ok((capture, caps)) => {
+                self.caps = caps;
                 self.hw_controls = capture.controls().unwrap_or_default();
                 self.apply_hw_profile(&capture);
                 self.capture = Some(capture);
@@ -285,6 +299,8 @@ impl App {
             Err(e) => {
                 // Sans capture on garde une fenêtre noire mais utilisable :
                 // l'utilisateur peut en choisir une autre dans le panneau.
+                self.caps.clear();
+                self.formats.clear();
                 log::error!("ouverture de {} : {e:#}", self.device.label());
                 self.notify(format!("échec : {}", self.device.card));
             }
@@ -522,9 +538,27 @@ impl App {
         {
             if let Err(e) = capture.set_control(id, value) {
                 log::warn!("contrôle matériel refusé : {e:#}");
-            } else if let Some(ctrl) = self.hw_controls.iter().find(|c| c.id == id) {
-                self.profile.hw_controls.insert(ctrl.name.clone(), value);
+            } else if let Some((name, is_switch)) = self
+                .hw_controls
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| (c.name.clone(), matches!(c.kind, camera::ControlKind::Boolean)))
+            {
+                self.profile.hw_controls.insert(name, value);
                 self.dirty = true;
+
+                // Un interrupteur — « exposition automatique », « balance des
+                // blancs automatique » — décide si le réglage qu'il pilote
+                // accepte encore une valeur. Sans relecture, le curseur voisin
+                // resterait grisé (ou actif) à tort jusqu'à la prochaine
+                // ouverture du panneau. Les curseurs, eux, ne changent l'état de
+                // personne : les relire à chaque pixel de glissement coûterait
+                // une énumération complète des contrôles par trame.
+                if is_switch
+                    && let Ok(controls) = capture.controls()
+                {
+                    self.hw_controls = controls;
+                }
             }
         }
         if actions.reset_color || actions.reset_all {
@@ -574,6 +608,7 @@ impl App {
                 height: profile.video.height,
                 fps: profile.video.fps,
                 pixfmt: profile.video.fourcc.as_deref().map(fourcc_of),
+                pixfmt_required: false,
                 buffers: self.request.buffers,
             };
             self.reopen(device, request);
@@ -586,6 +621,8 @@ impl App {
                 height: option.height,
                 fps: option.fps,
                 pixfmt: Some(option.pixfmt),
+                // Choisi à la main dans l'overlay, parmi ce que l'appareil annonce.
+                pixfmt_required: true,
                 buffers: self.request.buffers,
             };
             // Le format choisi devient celui du profil : c'est lui qu'on
@@ -978,10 +1015,18 @@ impl ApplicationHandler<Wake> for App {
             );
         }
 
-        // La capture s'arrête à la destruction ; on écrit la configuration
-        // seulement si quelque chose a bougé.
+        // La capture et l'audio s'arrêtent à la destruction. Les deux ferment
+        // du matériel et peuvent y traîner ; on chronomètre chaque étape pour
+        // qu'un journal suffise à désigner la coupable quand la fermeture
+        // s'éternise, sans avoir à attacher un débogueur.
+        let started = Instant::now();
         self.capture = None;
+        log::debug!("capture arrêtée en {} ms", started.elapsed().as_millis());
+
+        let started = Instant::now();
         self.audio = None;
+        log::debug!("audio arrêté en {} ms", started.elapsed().as_millis());
+
         if self.dirty {
             self.save();
         }

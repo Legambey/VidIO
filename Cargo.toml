@@ -37,6 +37,18 @@ pollster = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = "0.14"
 
+# --- Windows : capture Media Foundation, contrôles DirectShow ---
+# Aucune de ces lignes n'est compilée ailleurs : le build Linux est inchangé.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_DirectShow",
+    "Win32_System_Com",
+    # Rattachement à la console du terminal appelant : voir `console` dans main.rs.
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+] }
+
 [features]
 default = []
 # Backend PipeWire natif pour cpal (au lieu de passer par ALSA) : réduit un peu

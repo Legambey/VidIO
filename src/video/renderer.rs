@@ -16,6 +16,8 @@ const FLAG_CRT: u32 = 8;
 const FLAG_SMOOTH: u32 = 16;
 const FLAG_SRGB_SURFACE: u32 = 32;
 const FLAG_GREY: u32 = 64;
+const FLAG_UYVY: u32 = 128;
+const FLAG_NV12: u32 = 256;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -98,13 +100,16 @@ pub struct Renderer {
 
 /// Dimensions de la texture qu'occupera une trame de ce format.
 ///
-/// Ce n'est pas toujours la taille de l'image : le YUYV tient dans une texture
-/// RGBA de demi-largeur, un texel portant deux pixels. Un flux compressé, lui,
-/// arrive déjà décodé en RGBA pleine largeur — c'est le format publié par la
-/// capture, pas celui de l'appareil, qu'il faut passer ici.
+/// Ce n'est pas toujours la taille de l'image : le YUYV et l'UYVY tiennent dans
+/// une texture RGBA de demi-largeur, un texel portant deux pixels ; le NV12 est
+/// planaire et empile son plan de chrominance, de demi-hauteur, sous son plan de
+/// luminance. Un flux compressé, lui, arrive déjà décodé en RGBA pleine largeur
+/// — c'est le format publié par la capture, pas celui de l'appareil, qu'il faut
+/// passer ici.
 pub fn texture_size(pixfmt: PixelFormat, width: u32, height: u32) -> (u32, u32) {
     match pixfmt {
-        PixelFormat::Yuyv => (width.div_ceil(2), height),
+        PixelFormat::Yuyv | PixelFormat::Uyvy => (width.div_ceil(2), height),
+        PixelFormat::Nv12 => (width, height + height.div_ceil(2)),
         _ => (width, height),
     }
 }
@@ -284,13 +289,14 @@ impl Renderer {
     pub fn upload(&mut self, frame: &Frame) -> Result<()> {
         let fmt = frame.format;
 
-        // Le YUYV tient dans une texture RGBA de demi-largeur : un texel = deux
-        // pixels. Aucun octet n'est touché par le CPU, le dépaquetage a lieu
-        // dans le shader.
+        // Aucun octet n'est touché par le CPU : la trame est envoyée telle
+        // quelle, et le dépaquetage a lieu dans le shader. Le YUYV et l'UYVY
+        // tiennent dans une texture RGBA de demi-largeur — un texel = deux
+        // pixels ; le NV12 et le GREY sont des octets bruts qu'on lit un à un.
         let (bytes_per_pixel, texture_format) = match fmt.pixfmt {
-            PixelFormat::Yuyv => (2u32, wgpu::TextureFormat::Rgba8Unorm),
+            PixelFormat::Yuyv | PixelFormat::Uyvy => (2u32, wgpu::TextureFormat::Rgba8Unorm),
             PixelFormat::Rgba8 => (4, wgpu::TextureFormat::Rgba8Unorm),
-            PixelFormat::Grey => (1, wgpu::TextureFormat::R8Unorm),
+            PixelFormat::Grey | PixelFormat::Nv12 => (1, wgpu::TextureFormat::R8Unorm),
             other => anyhow::bail!("format {} non géré par le rendu", other.name()),
         };
         let (tex_width, tex_height) = texture_size(fmt.pixfmt, fmt.width, fmt.height);
@@ -343,7 +349,9 @@ impl Renderer {
 
         let texture = self.texture.as_ref().expect("texture créée juste au-dessus");
         let stride = if fmt.stride > 0 { fmt.stride } else { fmt.width * bytes_per_pixel };
-        let expected = stride as usize * fmt.height as usize;
+        // Compté sur la hauteur de la *texture*, pas sur celle de l'image : un
+        // plan de chrominance empilé dessous en fait partie.
+        let expected = stride as usize * tex_height as usize;
         if frame.data.len() < expected {
             anyhow::bail!(
                 "trame incomplète : {} octets pour {expected} attendus",
@@ -362,9 +370,9 @@ impl Renderer {
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(stride),
-                rows_per_image: Some(fmt.height),
+                rows_per_image: Some(tex_height),
             },
-            wgpu::Extent3d { width: tex_width, height: fmt.height, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: tex_width, height: tex_height, depth_or_array_layers: 1 },
         );
 
         Ok(())
@@ -392,11 +400,12 @@ impl Renderer {
             );
 
             let mut flags = 0;
-            if fmt.pixfmt == PixelFormat::Yuyv {
-                flags |= FLAG_YUYV;
-            }
-            if fmt.pixfmt == PixelFormat::Grey {
-                flags |= FLAG_GREY;
+            match fmt.pixfmt {
+                PixelFormat::Yuyv => flags |= FLAG_YUYV,
+                PixelFormat::Uyvy => flags |= FLAG_UYVY,
+                PixelFormat::Nv12 => flags |= FLAG_NV12,
+                PixelFormat::Grey => flags |= FLAG_GREY,
+                _ => {}
             }
             if fmt.color.matrix == YuvMatrix::Bt709 {
                 flags |= FLAG_BT709;
@@ -543,6 +552,14 @@ mod tests {
         assert_eq!(texture_size(PixelFormat::Yuyv, 3840, 2160), (1920, 2160));
         // Largeur impaire : le texel de bord est à moitié rempli, pas tronqué.
         assert_eq!(texture_size(PixelFormat::Yuyv, 721, 480), (361, 480));
+    }
+
+    #[test]
+    fn nv12_stacks_its_chroma_plane_under_the_luma_plane() {
+        // Un octet par texel : le plan de luminance fait la taille de l'image,
+        // le plan de chrominance entrelacé en fait la moitié en hauteur.
+        assert_eq!(texture_size(PixelFormat::Nv12, 1920, 1080), (1920, 1620));
+        assert_eq!(texture_size(PixelFormat::Nv12, 640, 480), (640, 720));
     }
 
     #[test]

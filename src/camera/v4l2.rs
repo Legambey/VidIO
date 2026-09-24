@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use v4l::buffer::Type as BufType;
 use v4l::io::mmap::Stream as MmapStream;
 use v4l::io::traits::{CaptureStream, Stream as StreamTrait};
@@ -80,23 +80,6 @@ fn by_id_map() -> HashMap<PathBuf, String> {
         map.insert(target, name);
     }
     map
-}
-
-/// Retrouve un périphérique par sa clé, son chemin ou son index.
-pub fn find(spec: &str) -> Result<VideoDevice> {
-    let devices = enumerate()?;
-    devices
-        .iter()
-        .find(|d| d.key.as_str() == spec)
-        .or_else(|| devices.iter().find(|d| d.path.to_string_lossy() == spec))
-        .or_else(|| {
-            spec.parse::<usize>()
-                .ok()
-                .and_then(|i| devices.iter().find(|d| d.index == i))
-        })
-        .or_else(|| devices.iter().find(|d| d.card.contains(spec)))
-        .cloned()
-        .ok_or_else(|| anyhow!("aucun périphérique ne correspond à « {spec} »"))
 }
 
 /// Traduit la colorimétrie annoncée par le pilote.
@@ -348,9 +331,19 @@ impl Camera for V4l2Camera {
 
     fn negotiate(&mut self, req: &FormatRequest) -> Result<FrameFormat> {
         let caps = self.caps()?;
-        let chosen = req
-            .pick(&caps)
-            .ok_or_else(|| anyhow!("l'appareil n'annonce aucun format exploitable"))?;
+        let chosen = req.pick(&caps).ok_or_else(|| super::no_format_error(req, &caps))?;
+
+        // Un format retenu qui n'est pas celui demandé vient forcément d'un
+        // profil : le dire, sinon l'image change sans explication.
+        if let Some(want) = req.pixfmt
+            && want != chosen.pixfmt
+        {
+            log::warn!(
+                "{} indisponible sur cet appareil : {} retenu à la place",
+                want.name(),
+                chosen.pixfmt.name()
+            );
+        }
 
         let fourcc = FourCC::new(&chosen.pixfmt.fourcc());
         let want = Format::new(chosen.width, chosen.height, fourcc);
