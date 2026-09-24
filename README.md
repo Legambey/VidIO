@@ -17,28 +17,29 @@ transit audio.
 
 ## Installation
 
-### Arch Linux
+Les binaires sont fournis dans la
+[dernière release](https://github.com/Legambey/VidIO/releases/latest) — rien à
+compiler.
+
+### Linux
+
+Télécharger `vidio`, puis :
 
 ```bash
-makepkg -si
+chmod +x vidio
+sudo install -m755 vidio /usr/local/bin/
 ```
 
-Le `PKGBUILD` fourni compile et installe `/usr/bin/vidio`. Dépendances tirées
-automatiquement : `alsa-lib`, `libxkbcommon`, `vulkan-icd-loader`.
+Trois bibliothèques doivent être présentes, ce qui est le cas sur toute machine
+de bureau : `alsa-lib`, `libxkbcommon` et le chargeur Vulkan
+(`vulkan-icd-loader` sur Arch, `libvulkan1` sur Debian et Ubuntu), plus un
+pilote Vulkan pour la carte graphique — `mesa` couvre Intel et AMD.
 
-### Linux, depuis les sources
+`v4l-utils` n'est **pas** nécessaire : VidIO parle directement aux ioctls du
+noyau, sans passer par `libv4l2`. Le paquet reste pratique pour diagnostiquer
+avec `v4l2-ctl`, rien de plus.
 
-```bash
-sudo pacman -S --needed rust alsa-lib     # ou l'équivalent de votre distribution
-cargo build --release
-./target/release/vidio
-```
-
-`v4l-utils` n'est **pas** nécessaire : la crate `v4l` parle directement aux
-ioctls du noyau, sans passer par `libv4l2`. Le paquet reste pratique pour
-diagnostiquer avec `v4l2-ctl`, rien de plus.
-
-Il faut appartenir au groupe `video` pour ouvrir `/dev/videoN` :
+Il faut en revanche appartenir au groupe `video` pour ouvrir `/dev/videoN` :
 
 ```bash
 sudo usermod -aG video $USER      # puis se reconnecter
@@ -46,17 +47,22 @@ sudo usermod -aG video $USER      # puis se reconnecter
 
 ### Windows
 
-Rien à installer côté système : Media Foundation, WASAPI et Direct3D 12 en font
-partie. Il faut la chaîne d'outils MSVC (`rustup default stable-msvc` et les
-outils de compilation C++ de Visual Studio, pour l'éditeur de liens), puis :
+Télécharger `vidio.exe` et le lancer. Rien à installer : Media Foundation,
+WASAPI et Direct3D 12 font partie du système.
 
-```
-cargo build --release
-```
+Le binaire n'ouvre pas de fenêtre de terminal à côté de la sienne. Les
+sous-commandes de diagnostic restent utilisables : lancées depuis un terminal,
+elles y écrivent normalement.
 
-Le binaire se lance depuis l'Explorateur sans ouvrir de fenêtre de terminal à
-côté. Les sous-commandes de diagnostic restent utilisables : lancées depuis un
-terminal, elles y écrivent normalement.
+Si la carte est détectée mais refuse de s'ouvrir, c'est presque toujours le
+réglage de confidentialité :
+voir [Quand ça ne marche pas](#quand-ça-ne-marche-pas).
+
+### Compiler soi-même
+
+`cargo build --release` suffit sous Linux. Sous Windows, il faut en plus la
+chaîne d'outils MSVC pour l'éditeur de liens. Le dépôt fournit aussi un
+`PKGBUILD` pour Arch.
 
 ---
 
