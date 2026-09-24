@@ -466,16 +466,47 @@ impl Capture {
     }
 }
 
+/// Temps laissé au thread de capture pour sortir avant qu'on l'abandonne.
+///
+/// Large pour un arrêt sain — quelques trames suffisent — et bien en deçà des
+/// cinq secondes au bout desquelles Windows déclare une fenêtre « ne répond
+/// pas ». Le reste de la fermeture (audio, GPU) doit tenir dans le solde.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
+
 impl Drop for Capture {
     fn drop(&mut self) {
         self.shared.running.store(false, Ordering::Relaxed);
         if let Some(unblock) = self.unblock.take() {
             unblock();
         }
-        if let Some(t) = self.thread.take() {
-            // Le thread teste `should_run` entre deux trames ; il sort au pire
-            // après le délai d'attente d'une trame.
-            let _ = t.join();
+        let Some(thread) = self.thread.take() else { return };
+
+        // Le thread teste `should_run` entre deux trames ; il sort au pire après
+        // le délai d'attente d'une trame. Au pire seulement : un pilote qui ne
+        // rend jamais la main laisse la capture coincée à l'intérieur, et comme
+        // `drop` tourne sur le thread de l'interface, l'attendre sans plafond y
+        // gèle la fenêtre et la boucle de messages. On attend donc à travers un
+        // thread tiers — `join` n'a pas de variante minutée — puis on abandonne.
+        let (done, waited) = std::sync::mpsc::channel();
+        let Ok(_waiter) = std::thread::Builder::new()
+            .name("vidio-capture-join".into())
+            .spawn(move || {
+                let _ = thread.join();
+                let _ = done.send(());
+            })
+        else {
+            // Plus de thread disponible : on ne peut ni attendre ni abandonner
+            // proprement. Sortir est encore ce qui bloque le moins.
+            log::warn!("arrêt de la capture non surveillé : création de thread impossible");
+            return;
+        };
+
+        if waited.recv_timeout(SHUTDOWN_GRACE).is_err() {
+            log::warn!(
+                "le thread de capture ne s'est pas arrêté en {} ms ; abandonné pour ne pas \
+                 figer l'interface. Le périphérique reste réservé jusqu'à la fin du processus.",
+                SHUTDOWN_GRACE.as_millis()
+            );
         }
     }
 }

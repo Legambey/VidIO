@@ -1015,10 +1015,18 @@ impl ApplicationHandler<Wake> for App {
             );
         }
 
-        // La capture s'arrête à la destruction ; on écrit la configuration
-        // seulement si quelque chose a bougé.
+        // La capture et l'audio s'arrêtent à la destruction. Les deux ferment
+        // du matériel et peuvent y traîner ; on chronomètre chaque étape pour
+        // qu'un journal suffise à désigner la coupable quand la fermeture
+        // s'éternise, sans avoir à attacher un débogueur.
+        let started = Instant::now();
         self.capture = None;
+        log::debug!("capture arrêtée en {} ms", started.elapsed().as_millis());
+
+        let started = Instant::now();
         self.audio = None;
+        log::debug!("audio arrêté en {} ms", started.elapsed().as_millis());
+
         if self.dirty {
             self.save();
         }
