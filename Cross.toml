@@ -1,0 +1,23 @@
+# L'image de `cross` est une Ubuntu 16.04 à glibc 2.23 — c'est tout son intérêt :
+# un binaire lié là-dedans tourne sur n'importe quelle distribution encore en
+# service. En revanche elle est minimale, et il manque trois choses.
+#
+# `alsa-sys` cherche ALSA par pkg-config, l'édition de liens réclame xkbcommon,
+# et `v4l2-sys-mit` génère les liaisons V4L2 avec bindgen — donc libclang. Celui
+# de l'image est un 3.8 trop ancien : il ne connaît pas
+# `clang_getTranslationUnitTargetInfo`, apparue en clang 5. Le dépôt de Xenial
+# offre un libclang 8, qui suffit.
+#
+# La couche est mise en cache par Docker : ce coût n'est payé qu'une fois.
+#
+# C'est aussi ce qu'aucune astuce d'éditeur de liens ne peut remplacer : il faut
+# un libasound compilé contre cette vieille glibc. Celui d'Arch exige des
+# symboles GLIBC_2.43, ce qui rend impossible tout binaire portable lié ici.
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes libasound2-dev libxkbcommon-dev libclang-8-dev",
+]
+
+# bindgen trouverait le libclang 3.8 en premier sans qu'on le pointe.
+[target.x86_64-unknown-linux-gnu.env]
+passthrough = ["LIBCLANG_PATH"]
