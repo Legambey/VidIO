@@ -1001,6 +1001,13 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // La fenêtre disparaît avant tout le reste : le démontage ferme du
+        // matériel et peut y traîner, et une fenêtre encore affichée qui ne
+        // pompe plus ses messages, Windows la déclare « ne répond pas ».
+        if let Some(window) = &self.window {
+            window.set_visible(false);
+        }
+
         // Bilan de session : la première chose qu'on regarde quand l'affichage
         // n'a pas la tête qu'on attendait.
         if let Some(capture) = &self.capture {

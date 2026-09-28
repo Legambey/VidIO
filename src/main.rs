@@ -392,7 +392,26 @@ fn cmd_run(
     let request = build_request(&profile, width, height, fps, fourcc);
 
     log::info!("ouverture de {} ({})", dev.label(), dev.key);
-    app::run(config, dev, request, audio)
+    let result = app::run(config, dev, request, audio);
+
+    // Un thread de capture abandonné est encore bloqué dans le code de Media
+    // Foundation. Une sortie ordinaire (`ExitProcess`) détacherait ces DLL sous
+    // ses pieds, et c'est un endroit de plus où la fermeture peut se figer —
+    // processus invisible mais vivant, carte toujours réservée. La
+    // configuration est déjà enregistrée ; on termine sans détachement.
+    #[cfg(windows)]
+    if camera::capture_abandoned() {
+        use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        if let Err(e) = &result {
+            log::error!("{e:#}");
+        }
+        log::warn!("sortie forcée : le thread de capture ne s'est pas arrêté");
+        unsafe {
+            let _ = TerminateProcess(GetCurrentProcess(), result.is_err() as u32);
+        }
+    }
+
+    result
 }
 
 fn cmd_bench(

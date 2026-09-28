@@ -12,12 +12,22 @@
 //! source de capture expose encore (`IAMVideoProcAmp`, `IAMCameraControl`) :
 //! c'est l'équivalent exact des contrôles V4L2, appliqué par le capteur, donc
 //! sans coût en CPU ni en latence.
+//!
+//! Le lecteur de source est ouvert en mode asynchrone. En mode synchrone,
+//! `ReadSample` attend une trame sans limite de temps : une console éteinte ou
+//! un câble débranché, et l'arrêt de la capture restait coincé chez le pilote —
+//! ni `Shutdown` sur la source ni aucun autre appel ne l'en tirait de façon
+//! fiable. En asynchrone, rien ne bloque : on demande une trame, Media
+//! Foundation rappelle `OnReadSample` sur l'un de ses threads quand elle
+//! arrive, et l'on redemande la suivante depuis ce rappel. L'arrêt est un
+//! `Flush`, qui annule la demande en vol sans attendre la carte.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use windows::Win32::Media::DirectShow::{
@@ -30,8 +40,9 @@ use windows::Win32::Media::DirectShow::{
     VideoProcAmp_Saturation, VideoProcAmp_Sharpness, VideoProcAmp_WhiteBalance,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFActivate, IMFMediaSource, IMFMediaType, IMFSourceReader,
-    MFCreateAttributes, MFCreateDeviceSource, MFCreateSourceReaderFromMediaSource,
+    IMFAttributes, IMFActivate, IMFMediaEvent, IMFMediaSource, IMFMediaType, IMFSample,
+    IMFSourceReader, IMFSourceReaderCallback, IMFSourceReaderCallback_Impl,
+    MF_SOURCE_READER_ASYNC_CALLBACK, MFCreateAttributes, MFCreateDeviceSource, MFCreateSourceReaderFromMediaSource,
     MFEnumDeviceSources, MFMediaType_Video, MFSTARTUP_NOSOCKET, MFSampleExtension_Discontinuity,
     MFStartup, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
@@ -43,7 +54,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_VERSION,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
-use windows::core::{GUID, Interface, PCWSTR, PWSTR};
+use windows::core::{ComObject, GUID, HRESULT, Interface, PCWSTR, PWSTR, Ref, implement};
 
 use super::{
     Camera, CameraControls, Capture, ColorSpec, ControlDesc, ControlKind, FormatCaps,
@@ -246,6 +257,9 @@ pub struct MfCamera {
     info: VideoDevice,
     source: Arc<Source>,
     reader: Handle<IMFSourceReader>,
+    /// Inscrit dans le lecteur dès sa création : le mode asynchrone ne se
+    /// choisit pas après coup. Il reste inerte jusqu'à `start`.
+    callback: ComObject<ReaderCallback>,
 }
 
 impl MfCamera {
@@ -267,11 +281,15 @@ impl MfCamera {
         }
         .map_err(|e| open_error(e, &info))?;
 
-        let reader_attrs = create_attributes(1)?;
+        let callback = ComObject::new(ReaderCallback::default());
+        let reader_attrs = create_attributes(2)?;
         let reader = unsafe {
             // Voir l'en-tête du module : c'est la ligne qui garantit qu'aucune
             // conversion n'a lieu dans notre dos.
             reader_attrs.SetUINT32(&MF_READWRITE_DISABLE_CONVERTERS, 1)?;
+            // Et celle qui rend l'arrêt possible à tout moment.
+            let as_callback: IMFSourceReaderCallback = callback.to_interface();
+            reader_attrs.SetUnknown(&MF_SOURCE_READER_ASYNC_CALLBACK, &as_callback)?;
             let reader = MFCreateSourceReaderFromMediaSource(&source, &reader_attrs)
                 .map_err(|e| anyhow!("création du lecteur de source : {e}"))?;
             reader
@@ -280,7 +298,12 @@ impl MfCamera {
             reader
         };
 
-        Ok(Self { info, source: Arc::new(Source(Handle(source))), reader: Handle(reader) })
+        Ok(Self {
+            info,
+            source: Arc::new(Source(Handle(source))),
+            reader: Handle(reader),
+            callback,
+        })
     }
 }
 
@@ -480,9 +503,9 @@ impl Camera for MfCamera {
         let mut me = *self;
         let capture_format = me.negotiate(&req)?;
 
-        // Même règle que sous Linux : un flux compressé est décodé sur le thread
-        // de capture, qui a tout le temps d'une trame pour le faire, et publié
-        // en RGBA pleine largeur.
+        // Même règle que sous Linux : un flux compressé est décodé côté capture
+        // — ici dans le rappel du lecteur —, qui a tout le temps d'une trame
+        // pour le faire, et publié en RGBA pleine largeur.
         let published_format = if capture_format.pixfmt.published() != capture_format.pixfmt {
             FrameFormat {
                 pixfmt: capture_format.pixfmt.published(),
@@ -497,63 +520,177 @@ impl Camera for MfCamera {
         let controls = me.control_handle();
         let (sink, mut capture) = super::channel(published_format, controls, notify);
 
+        let stream = Stream {
+            reader: me.reader,
+            sink,
+            capture_format,
+            published_format,
+            decoder: capture_format.pixfmt.is_compressed().then(MjpegDecoder::new),
+            label: me.info.card.clone(),
+        };
+
+        // Pas de thread à nous : la première demande amorce la chaîne, chaque
+        // trame reçue redemande la suivante.
+        let callback = me.callback.clone();
+        {
+            let mut slot = lock(&callback.stream);
+            let stream = slot.insert(stream);
+            if let Err(e) = stream.request() {
+                // Rendre le lecteur tout de suite : il tient le callback, qui
+                // le tiendrait en retour.
+                slot.take();
+                return Err(e);
+            }
+        }
+
         let source = Arc::clone(&me.source);
-        let unblock = Arc::clone(&me.source);
-        let reader = me.reader;
-        let label = me.info.card.clone();
-
-        let thread = std::thread::Builder::new()
-            .name("vidio-capture".into())
-            .spawn(move || {
-                com_init();
-                // La source doit rester vivante aussi longtemps que le lecteur
-                // s'en sert ; elle n'est éteinte qu'à la fin du flux.
-                let _source = source;
-                if let Err(e) = pump(&reader, capture_format, published_format, &sink) {
-                    log::error!("capture {label} interrompue : {e:#}");
-                    sink.note_error();
-                }
-            })
-            .context("démarrage du thread de capture")?;
-
-        capture.thread = Some(thread);
-        // `ReadSample` bloque sans plafond : sans ça, fermer la fenêtre pendant
-        // que la carte ne délivre plus rien — console éteinte, câble débranché —
-        // attendrait indéfiniment. Éteindre la source fait échouer l'attente.
-        capture.unblock = Some(Box::new(move || unblock.shutdown()));
+        capture.unblock = Some(Box::new(move || {
+            callback.stop();
+            source.shutdown();
+        }));
         Ok(capture)
     }
 }
 
-/// Boucle de capture. Tourne jusqu'à ce que le [`Capture`] soit lâché.
-fn pump(
-    reader: &IMFSourceReader,
+/// Plafond de l'attente d'`OnFlush`, pris sur le délai de grâce de
+/// [`Capture`] : il faut laisser de quoi éteindre la source ensuite.
+const FLUSH_WAIT: Duration = Duration::from_millis(1000);
+
+/// Verrou qui survit à une panique : un rappel de Media Foundation ne doit
+/// jamais paniquer à son tour pour un verrou empoisonné.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ce que le rappel doit connaître pour traiter une trame et demander la
+/// suivante. N'existe qu'entre `start` et l'arrêt.
+struct Stream {
+    reader: Handle<IMFSourceReader>,
+    sink: FrameSink,
     capture_format: FrameFormat,
     published_format: FrameFormat,
-    sink: &FrameSink,
-) -> Result<()> {
-    const ENDOFSTREAM: u32 = MF_SOURCE_READERF_ENDOFSTREAM.0 as u32;
-    const ERROR: u32 = MF_SOURCE_READERF_ERROR.0 as u32;
-    const STREAMTICK: u32 = MF_SOURCE_READERF_STREAMTICK.0 as u32;
-    const TYPECHANGED: u32 = MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32;
+    decoder: Option<MjpegDecoder>,
+    label: String,
+}
 
-    let mut decoder = capture_format.pixfmt.is_compressed().then(MjpegDecoder::new);
+/// Rappel du lecteur de source asynchrone.
+#[implement(IMFSourceReaderCallback)]
+#[derive(Default)]
+struct ReaderCallback {
+    /// Le lecteur tient ce rappel, et `Stream` tient le lecteur : le cycle
+    /// n'est rompu qu'en vidant cette case, ce que fait [`ReaderCallback::stop`].
+    stream: Mutex<Option<Stream>>,
+    flushed: Mutex<bool>,
+    flush_done: Condvar,
+}
 
-    while sink.should_run() {
-        let mut flags = 0u32;
-        let mut sample = None;
-        unsafe {
-            reader.ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample))
+impl ReaderCallback {
+    fn on_sample(&self, status: HRESULT, flags: u32, sample: Option<&IMFSample>) {
+        let mut slot = lock(&self.stream);
+        let Some(stream) = slot.as_mut() else { return };
+        // Arrêt demandé : cette réponse, quelle qu'elle soit, est la dernière.
+        // Une demande annulée par `Flush` revient d'ailleurs en échec.
+        if !stream.sink.should_run() {
+            return;
         }
-        .map_err(|e| anyhow!("lecture d'une trame : {e}"))?;
+
+        let outcome = status
+            .ok()
+            .map_err(|e| anyhow!("lecture d'une trame : {e}"))
+            .and_then(|()| stream.deliver(flags, sample))
+            .and_then(|more| if more && stream.sink.should_run() { stream.request() } else { Ok(()) });
+        if let Err(e) = outcome {
+            log::error!("capture {} interrompue : {e:#}", stream.label);
+            stream.sink.note_error();
+        }
+    }
+
+    /// Arrête le flux sans jamais attendre le pilote plus que [`FLUSH_WAIT`].
+    ///
+    /// `sink.should_run()` est déjà faux quand on arrive ici : aucune nouvelle
+    /// demande ne partira. Reste celle en vol, que `Flush` annule — il est
+    /// asynchrone lui aussi, et `OnFlush` en confirme la fin.
+    fn stop(&self) {
+        // Le lecteur est cloné hors du verrou : un `OnReadSample` en cours le
+        // tient le temps de sa trame, et `Flush` ne doit pas dépendre de lui.
+        let reader = lock(&self.stream).as_ref().map(|s| s.reader.0.clone());
+        if let Some(reader) = reader {
+            *lock(&self.flushed) = false;
+            if unsafe { reader.Flush(STREAM) }.is_ok() {
+                let flushed = lock(&self.flushed);
+                let (_flushed, wait) = self
+                    .flush_done
+                    .wait_timeout_while(flushed, FLUSH_WAIT, |done| !*done)
+                    .unwrap_or_else(|e| e.into_inner());
+                if wait.timed_out() {
+                    log::warn!(
+                        "le lecteur de source n'a pas confirmé l'arrêt en {} ms",
+                        FLUSH_WAIT.as_millis()
+                    );
+                }
+            }
+        }
+        // Rompt le cycle lecteur ↔ rappel : sans ça, ni l'un ni l'autre ne
+        // serait jamais libéré, et la carte resterait réservée.
+        drop(lock(&self.stream).take());
+    }
+}
+
+impl IMFSourceReaderCallback_Impl for ReaderCallback_Impl {
+    fn OnReadSample(
+        &self,
+        hrstatus: HRESULT,
+        _stream: u32,
+        flags: u32,
+        _timestamp: i64,
+        sample: Ref<IMFSample>,
+    ) -> windows::core::Result<()> {
+        // Une panique qui traverserait la frontière COM avorterait le
+        // processus ; arrêtée ici, elle ne coûte que la capture.
+        let outcome =
+            std::panic::catch_unwind(AssertUnwindSafe(|| self.on_sample(hrstatus, flags, sample.as_ref())));
+        if outcome.is_err() {
+            log::error!("panique pendant le traitement d'une trame : capture arrêtée");
+        }
+        Ok(())
+    }
+
+    fn OnFlush(&self, _stream: u32) -> windows::core::Result<()> {
+        *lock(&self.flushed) = true;
+        self.flush_done.notify_all();
+        Ok(())
+    }
+
+    fn OnEvent(&self, _stream: u32, _event: Ref<IMFMediaEvent>) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+impl Stream {
+    /// Demande la trame suivante ; elle arrivera par `OnReadSample`.
+    fn request(&self) -> Result<()> {
+        unsafe { self.reader.ReadSample(STREAM, 0, None, None, None, None) }
+            .map_err(|e| anyhow!("demande d'une trame : {e}"))
+    }
+
+    /// Traite une réponse du lecteur. `Ok(false)` : le flux est terminé, ne
+    /// plus rien demander.
+    fn deliver(&mut self, flags: u32, sample: Option<&IMFSample>) -> Result<bool> {
+        const ENDOFSTREAM: u32 = MF_SOURCE_READERF_ENDOFSTREAM.0 as u32;
+        const ERROR: u32 = MF_SOURCE_READERF_ERROR.0 as u32;
+        const STREAMTICK: u32 = MF_SOURCE_READERF_STREAMTICK.0 as u32;
+        const TYPECHANGED: u32 = MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32;
+
+        let Stream { reader, sink, capture_format, published_format, decoder, .. } = self;
+        let published_format = *published_format;
 
         if flags & ENDOFSTREAM != 0 {
             log::info!("fin de flux signalée par le pilote");
-            break;
+            return Ok(false);
         }
         if flags & ERROR != 0 {
             sink.note_error();
-            continue;
+            return Ok(true);
         }
         if flags & TYPECHANGED != 0 {
             // Le pilote a changé de format sous nos pieds : la trame suivante
@@ -562,7 +699,7 @@ fn pump(
             let live = unsafe { reader.GetCurrentMediaType(STREAM) }
                 .map_err(|e| anyhow!("relecture du format : {e}"))
                 .and_then(|mt| describe(&mt))?;
-            if live != capture_format {
+            if live != *capture_format {
                 bail!(
                     "le pilote est passé en {}x{} {} — rouvrir le périphérique",
                     live.width,
@@ -572,14 +709,14 @@ fn pump(
             }
         }
 
-        // Le lecteur rend la main sans trame quand il ne fait que signaler un
-        // trou dans le flux. Sur USB, c'est le symptôme d'une bande passante
+        // Le lecteur répond sans trame quand il ne fait que signaler un trou
+        // dans le flux. Sur USB, c'est le symptôme d'une bande passante
         // insuffisante — exactement ce que compte `missed` sous Linux.
         let Some(sample) = sample else {
             if flags & STREAMTICK != 0 {
                 sink.note_missed(1);
             }
-            continue;
+            return Ok(true);
         };
 
         if unsafe { sample.GetUINT32(&MFSampleExtension_Discontinuity) } == Ok(1) {
@@ -638,9 +775,8 @@ fn pump(
             }
             None => sink.note_error(),
         }
+        Ok(true)
     }
-
-    Ok(())
 }
 
 // --- contrôles matériels ---------------------------------------------------

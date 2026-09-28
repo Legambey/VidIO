@@ -47,7 +47,12 @@ windows = { version = "0.62", features = [
     # Rattachement à la console du terminal appelant : voir `console` dans main.rs.
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
+    # Sortie forcée quand la capture reste coincée chez le pilote : voir `cmd_run`.
+    "Win32_System_Threading",
 ] }
+# Exigée par la macro `#[implement]` (rappel du lecteur de source asynchrone),
+# qui désigne `::windows_core` en toutes lettres. Déjà tirée par `windows`.
+windows-core = "0.62"
 
 [features]
 default = []

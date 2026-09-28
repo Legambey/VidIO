@@ -3116,6 +3116,7 @@ dependencies = [
  "v4l",
  "wgpu",
  "windows",
+ "windows-core",
  "winit",
  "zune-jpeg",
 ]
